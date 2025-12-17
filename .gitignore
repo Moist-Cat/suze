@@ -1,0 +1,18 @@
+# dataset
+*.tsv
+
+# bloat
+metadata_*
+
+# vim
+*~
+*.swo
+*.swp
+
+# python
+**/__pycache__
+
+# rubbish
+NOTE
+cache
+logs
