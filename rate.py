@@ -21,17 +21,25 @@ class RateLimiter(ABC):
         """Release the rate limiter (for connection pool management)"""
         pass
 
+    async def __aenter__(self):
+        return await self.acquire()
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return self.release()
+
 
 class WindowRateLimiter(RateLimiter):
     """Fixed window rate limiter for simple use cases"""
 
-    def __init__(self, requests_per_second: float):
+    def __init__(self, requests_per_second: float = 1, num_threads: int = 10):
         self.interval = 1.0 / requests_per_second
+        # no more than 10 threads waiting
+        self.semaphore = asyncio.Semaphore(num_threads)
         self._last_request = 0
         self._lock = asyncio.Lock()
-        # only one concurrent fetch as well
 
     async def acquire(self) -> None:
+        await self.semaphore.acquire()
         async with self._lock:
             current_time = time.time()
             time_since_last = current_time - self._last_request
@@ -43,13 +51,7 @@ class WindowRateLimiter(RateLimiter):
             self._last_request = time.time()
 
     def release(self) -> None:
-        pass
+        self.semaphore.release()
 
     def __str__(self):
         return f"<{self.__class__.__name__} ({self.interval=})>"
-
-    async def __aenter__(self):
-        return await self.acquire()
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return self.release()

@@ -1,10 +1,5 @@
-from abc import ABC, abstractmethod
 import bisect
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Callable, Union
-from pathlib import Path
-import csv
-import json
+from typing import Any, Dict, Callable
 import operator
 import re
 
@@ -17,6 +12,7 @@ logger = get_logger("search")
 
 
 def matches_query(item: Dict, query: str, key: str, dependencies: Dict) -> bool:
+    del dependencies  # default doesn't use it
     search_columns = [key] if key else item.keys()
     query = re.compile(query)
 
@@ -93,6 +89,8 @@ def html_search(html_content, dependencies, *args, get_attrs=None, **kwargs):
     """
     Search strategy for HTML ASTs using BeautifulSoup4.
     """
+    del dependencies  # contextual search is unnecessary in web pages
+
     if not args and not kwargs and not get_attrs:
         return html_content
 
@@ -109,6 +107,12 @@ def html_search(html_content, dependencies, *args, get_attrs=None, **kwargs):
     for page in html_content:
         soup = BeautifulSoup(page, "html.parser")
         res = soup.find_all(*args, **kwargs)
+        # NOTE fix this?
+        # We need the empty values for consistency
+        # but it shouldn't work like this in general
+        if not res:
+            # add empty result
+            results.append({})
         for item in res:
             itemey = {}
             if fetch_all:
