@@ -1,0 +1,22 @@
+[Unit]
+Description=Suze pipeline daemon
+After=network-online.target
+
+[Service]
+Type=notify
+User=suze
+Group=suze
+Environment=SUZE_SOCKET=/run/suze/suze.sock
+Environment=SUZE_CONFIG=/etc/suze/pipelines.toml
+ExecStart=/opt/suze/venv/bin/suze daemon
+RuntimeDirectory=suze
+RuntimeDirectoryMode=0750
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+WatchdogSec=60
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

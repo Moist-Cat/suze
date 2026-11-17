@@ -16,3 +16,5 @@ metadata_*
 NOTE
 cache
 logs
+
+src/suze.egg-info

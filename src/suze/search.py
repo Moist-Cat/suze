@@ -11,13 +11,28 @@ from suze.log import get_logger
 logger = get_logger("search")
 
 
-def matches_query(item: Dict, query: str, key: str, dependencies: Dict) -> bool:
+def matches_query(
+        item: Any,
+        query: str,
+        key: str,
+        dependencies: Dict | None = None,
+        accessor=None
+    ) -> bool:
     del dependencies  # default doesn't use it
-    search_columns = [key] if key else item.keys()
+    accessor = accessor or item.__getitem__
+    if key:
+        search_columns = [key]
+    else:
+        if hasattr(item, "keys"):
+            search_columns = item.keys()
+        else:
+            # the whole item
+            search_columns = [item]
+
     query = re.compile(query)
 
     for column in search_columns:
-        if re.search(query, item[column]):
+        if re.search(query, accessor(column)):
             return True
     return False
 
@@ -57,6 +72,21 @@ def linear_search(
     return results
 
 
+def text_search(data: str, dependencies, query=None, key=None) -> list:
+    """Substring search over a string or list of strings.
+
+    Complements `linear_search` (which requires list[dict]). Used by
+    FileDataSource for .txt and .log files.
+    """
+    del dependencies, key
+    if not query:
+        return data
+    if isinstance(data, str):
+        lines = data.splitlines()
+    else:
+        lines = list(data)
+    return [line for line in lines if isinstance(line, str) and query in line]
+
 def binary_search(data, dependencies, query: Any = None, key: str = None):
     """
     Assumes the items are sorted
@@ -85,32 +115,40 @@ def binary_search(data, dependencies, query: Any = None, key: str = None):
 
 
 # html
-def html_search(html_content, dependencies, *args, get_attrs=None, **kwargs):
+def html_search(data: str | list[str], dependencies, *args, get_attrs=None, search_attrs=None, query=None, fill=True, **kwargs) -> list:
     """
     Search strategy for HTML ASTs using BeautifulSoup4.
+    `fill`: Wheter to fill with empty records to return a result of the same size.
+        It helps to keep a record of empty/invalid values and is on by default.
     """
     del dependencies  # contextual search is unnecessary in web pages
 
     if not args and not kwargs and not get_attrs:
-        return html_content
+        return data
 
     get_text = "full_text"
     if not get_attrs:
         get_attrs = [get_text]
+    if not search_attrs:
+        search_attrs = []
+
+    if query is not None and not (len(search_attrs) == 1):
+        raise ValueError(
+            "query is only supported for requests that only fetch the text present in the page."
+            "One query that covers multiple (or no) attributes is ambiguous."
+        )
+
     fetch_all = False
     if "*" in get_attrs:
         fetch_all = True
 
-    if not isinstance(html_content, list):
-        html_content = [html_content]
+    if not isinstance(data, list):
+        data = [data]
     results = []
-    for page in html_content:
+    for page in data:
         soup = BeautifulSoup(page, "html.parser")
         res = soup.find_all(*args, **kwargs)
-        # NOTE fix this?
-        # We need the empty values for consistency
-        # but it shouldn't work like this in general
-        if not res:
+        if not res and fill:
             # add empty result
             results.append({})
         for item in res:
@@ -119,10 +157,21 @@ def html_search(html_content, dependencies, *args, get_attrs=None, **kwargs):
                 itemey = item.attrs.copy()
                 itemey[get_text] = item.text
             else:
+                # filter
+                if search_attrs == [get_text]:
+                    accessor = lambda _: i.text
+                else:
+                    # default
+                    accessor = None
+                if query and not matches_query(item, query, search_attrs, accessor=accessor):
+                    continue
+                        
                 for attr in get_attrs:
                     if attr == get_text:
-                        itemey[get_text] = item.text
-                        continue
-                    itemey[attr] = item[attr]
+                        val = item.text
+                    else:
+                        val = item[attr]
+
+                    itemey[attr] = val
             results.append(itemey)
     return results

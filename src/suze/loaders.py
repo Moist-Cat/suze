@@ -10,12 +10,8 @@ import csv
 from pathlib import Path
 import asyncio
 import aiohttp
+import aiofiles
 from typing import Callable
-
-try:
-    from yt_dlp import YoutubeDL as yt
-except ImportError:
-    yt = None
 
 from suze.log import get_logger
 from suze.retry import with_retry, RetryConfig
@@ -26,35 +22,6 @@ logger = get_logger("loader")
 
 # I/O
 # file system
-def _sync_read(file_path: Path) -> str:
-    """Synchronously reads a text file from the filesystem.
-
-    Args:
-        file_path: Path to the file to read.
-
-    Returns:
-        The file contents as a string.
-
-    Raises:
-        IOError: If the file cannot be read.
-        UnicodeDecodeError: If the file contains invalid UTF-8 characters.
-
-    Example:
-        >>> content = _sync_read(Path("data.txt"))
-    """
-    logger.debug(f"Reading file synchronously: {file_path}")
-    try:
-        with open(file_path, encoding="utf8") as fd:
-            content = fd.read()
-            logger.debug(
-                f"Successfully read {len(content)} characters from {file_path}"
-            )
-            return content
-    except Exception as e:
-        logger.error(f"Failed to read file {file_path}: {str(e)}")
-        raise
-
-
 async def text_loader(file_path: Path) -> str:
     """Asynchronously loads a text file.
 
@@ -71,7 +38,13 @@ async def text_loader(file_path: Path) -> str:
         >>> content = await text_loader(Path("data.txt"))
     """
     logger.info(f"Loading text file: {file_path}")
-    return await asyncio.to_thread(_sync_read, file_path)
+    try:
+        async with aiofiles.open(file_path, mode="r", encoding="utf8") as fd:
+            return await fd.read()
+    except (IOError, UnicodeDecodeError) as e:
+        logger.error(f"Failed to read file {file_path}: {e}")
+        raise
+
 
 
 async def json_loader(file_path: Path):
@@ -90,7 +63,7 @@ async def json_loader(file_path: Path):
     Example:
         >>> data = await json_loader(Path("config.json"))
     """
-    logger.info(f"Loading JSON file: {file_path}")
+    logger.debug(f"Loading JSON file: {file_path}")
     content = await text_loader(file_path)
     try:
         data = json.loads(content)
@@ -100,6 +73,13 @@ async def json_loader(file_path: Path):
         logger.error(f"Failed to parse JSON from {file_path}: {str(e)}")
         raise
 
+async def mloader(file_path: Path, glob: str, loader):
+    logger.info(f"Loading all files that match %s in %s with %s", glob, str(file_path), loader.__name__)
+    data = []
+    for path in file_path.glob(glob):
+        data.append(await loader(path))
+    logger.info(f"Successfully parsed data from %s", str(file_path))
+    return data
 
 async def tsv_loader(file_path: Path):
     """Asynchronously loads and parses a TSV (Tab-Separated Values) file.
@@ -181,7 +161,7 @@ async def log_loader(file_path: Path):
 
 # net
 @with_retry(RetryConfig(max_attempts=10))
-async def http_loader(session, url, method, request_data, headers, raw=False):
+async def http_loader(session, url, method, request_data, headers, raw=False) -> dict | str:
     """Asynchronously loads data from an HTTP endpoint.
 
     Args:
@@ -255,97 +235,6 @@ async def http_loader(session, url, method, request_data, headers, raw=False):
     except Exception as e:
         logger.error(f"HTTP request failed for {url}: {str(e)}")
         raise
-
-
-async def yt_loader(data, search_limit=5):
-    """Asynchronously searches YouTube for trailer videos based on movie data.
-
-    Args:
-        data: Dictionary containing movie metadata. Must include:
-            - primaryTitle: The title of the movie/TV show.
-            - startYear: The release year.
-            - tconst: (Optional) IMDb identifier, will be preserved in results.
-        search_limit: Maximum number of YouTube results to return (default: 5).
-
-    Returns:
-        List of dictionaries containing YouTube video metadata. Each dictionary
-        includes a subset of YouTube video properties and the original movie
-        metadata (tconst, primaryTitle, startYear).
-
-        Returns empty list if required fields are missing from input data.
-
-    Example:
-        >>> movie_data = {
-        ...     'primaryTitle': 'Inception',
-        ...     'startYear': '2010',
-        ...     'tconst': 'tt1375666'
-        ... }
-        >>> videos = await yt_loader(movie_data, search_limit=3)
-        >>> # videos[0] = {
-        >>> #     'id': 'video_id',
-        >>> #     'title': 'Inception Official Trailer',
-        >>> #     'tconst': 'tt1375666',
-        >>> #     'primaryTitle': 'Inception',
-        >>> #     'startYear': '2010',
-        >>> #     ... other YouTube metadata
-        >>> # }
-    """
-    if yt is None:
-        raise ImportError("Please install yt-dlp")
-    if not ("primaryTitle" in data and "startYear" in data):
-        return []
-
-    search_query = f"{data['primaryTitle']} {data['startYear']} Official Trailer"
-
-    def sync_yt_loader(search_query=search_query):
-        """Synchronous YouTube search using yt-dlp."""
-        result = []
-        KEYS = {
-            "id",
-            "title",
-            "webpage_url",
-            "duration",
-            "duration_string",
-            "view_count",
-            "like_count",
-            "description",
-            "channel",
-            "uploader",
-            "channel_id",
-            "uploader_id",
-            "channel_url",
-            "channel_follower_count",
-            "upload_date",
-            "categories",
-            "tags",
-            "comment_count",
-            "average_rating",
-            "channel_is_verified",
-            "channel_follower_count",
-        }
-        options = {
-            "ignore_no_formats_error": True,
-            "ignoreerrors": "only_download",
-        }
-        with yt(options) as ydl:
-            results = ydl.extract_info(
-                f"ytsearch{search_limit}:{search_query}", download=False
-            )
-            videos = results.get("entries", [])[:search_limit]
-            for idx in range(len(videos)):
-                video = videos[idx]
-                for key in video.copy().keys():
-                    if key not in KEYS:
-                        del video[key]
-                # preserve metadata from previous step
-                video["tconst"] = data["tconst"]
-                video["primaryTitle"] = data["primaryTitle"]
-                video["startYear"] = data["startYear"]
-            result.extend(videos)
-        return result
-
-    return await asyncio.to_thread(sync_yt_loader)
-
 
 # in memory
 async def merge_loader(
@@ -486,7 +375,7 @@ async def merge_loader(
                     f"Using existing merged entry for target value: {on_value}"
                 )
 
-            for field, value in record.items():
+            for field, value in record.copy().items(): # the record may change
                 if field == target:
                     merged[field] = value
                     continue

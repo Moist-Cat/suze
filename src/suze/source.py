@@ -58,6 +58,9 @@ from suze.registries import Registry
 from suze.request import DataRequest
 from suze.utils import rolling_hash
 from suze.metrics import start_noop_span
+from suze.observe import get_observer
+from suze.enforce import validate_stage
+from suze.sink import pipe_sink
 
 
 # Decorators for instrumentation
@@ -97,6 +100,7 @@ class DataSource(ABC):
         source_id: str,
         cache: Optional[CacheBackend] = None,
         rate_limiter=None,
+        stages=None,
     ):
         """Initialize a data source with caching and rate limiting support.
 
@@ -109,8 +113,6 @@ class DataSource(ABC):
             rate_limiter: Rate limiter instance controlling request frequency.
                          Defaults to asyncio.Semaphore(1) for serial execution.
 
-        Raises:
-            ValueError: If source_id is empty or invalid
         """
         self.source_id = source_id
         if cache is not None:
@@ -119,26 +121,36 @@ class DataSource(ABC):
         self.rate_limiter = rate_limiter or asyncio.Semaphore(1)
         self.lock = asyncio.Lock()
 
-        self.stages = ["load", "search", "validate", "transform", "drop", "rename"]
-
-        # Initialize stage definitions
-        self.regs = {}
-        for stage_name in self.stages:
-            self.regs[stage_name] = Registry()
-
-        self.regs["drop"].register("default", drop_transform)
-        self.regs["rename"].register("default", rename_transform)
+        # load from external source
+        # filter
+        # validate against schema
+        # make changes
+        # drop irrelevant data
+        # rename columns to comply with the next API
+        # pipe the results to another source
+        self.stages = []
+        default_stages = stages or ["load", "search", "validate", "transform", "drop", "rename", "pipe"]
 
         # Initialize metrics collection
         self.metrics = {
-            "stage_times": {stage: 0.0 for stage in self.stages},
             "requests_total": 0,
             "requests_failed": 0,
             "total_execution_time": 0.0,
-            "stage_counts": {stage: 0 for stage in self.stages},
             "dependency_resolution_time": 0.0,
             "rate_limit_wait_time": 0.0,
+            "stage_times": {},
+            "stage_counts": {},
         }
+
+        # Initialize stage definitions
+        self.regs = {}
+        for stage_name in default_stages:
+            self.register_stage(stage_name)
+
+        self.regs["validate"].register("default", validate_stage)
+        self.regs["drop"].register("default", drop_transform)
+        self.regs["rename"].register("default", rename_transform)
+        self.regs["pipe"].register("default", pipe_sink)
 
         self._tracer = trace.get_tracer(self.__class__.__name__)
         self._meter = metrics.get_meter(self.__class__.__name__)
@@ -229,10 +241,13 @@ class DataSource(ABC):
         """
         return f"<{self.__class__.__name__}>"
 
+    # necessary to avoid cache misses
+    __repr__ = __str__
+
     def __hash__(self):
         return rolling_hash(self.source_id)
 
-    def register_stage(self, stage_name, after=None):
+    def register_stage(self, stage_name, after=None, default=None):
         """Register a new stage in the processing pipeline.
 
         Args:
@@ -253,6 +268,12 @@ class DataSource(ABC):
         self.metrics["stage_times"][stage_name] = 0.0
         self.metrics["stage_counts"][stage_name] = 0
         self.regs[stage_name] = Registry()
+
+        if default is not None:
+            self.register_strategy(stage_name, default)
+
+    def register_strategy(self, stage_name, fn, label="default"):
+        self.regs[stage_name].register(label, fn)
 
     async def _execute_stage(
         self,
@@ -291,24 +312,15 @@ class DataSource(ABC):
             current_span.set_attribute(
                 "datasource.stage_number", self.stages.index(stage_name)
             )
-
+        
         if stage_name not in request.stages:
             return data
         stage = request.stages[stage_name]
-        func = None
-        kwargs = {}
+        user_strategy = stage.strategy
+        kwargs = dict(stage.parameters)          # copy, handlers mutate
         data_format = "default"
-        if stage:
-            func = stage.get("strategy", func)
-            kwargs = stage.get("parameters", kwargs)
-            if stage and (not "parameters" in stage and not "strategy" in stage):
-                # should be a model/static class
-                raise ValueError(
-                    f"Invalid stage definition. Expected a 'parameters' field, found {stage}."
-                )
 
-        # Class-level overrides
-        # The class overrides the parameters
+        # Class-level overrides still apply for type and param preparation
         get_type = f"get_{stage_name}_type"
         get_params = f"get_{stage_name}_params"
         if hasattr(self, get_type):
@@ -316,12 +328,14 @@ class DataSource(ABC):
         if hasattr(self, get_params):
             kwargs = await getattr(self, get_params)(kwargs, dependencies)
 
-        # Request can override the executor
-        if func is None:
+        # A user-specified strategy wins over dynamic format detection
+        if user_strategy is not None and isinstance(user_strategy, str):
+            func = self.regs[stage_name].get(user_strategy)
+        elif user_strategy and isinstance(user_strategy, Callable):
+            func = user_strategy
+        else:
             func = self.regs[stage_name].get(data_format)
 
-        # If it's still None there is
-        # nothing we can do but but echo
         if func is None:
             self.logger.debug(
                 "No executor defined for stage %s of %s",
@@ -329,14 +343,15 @@ class DataSource(ABC):
                 self.source_id,
             )
             return data
-
         # Prepare arguments
         # For load stage, no input data, and await
         if hasattr(func, "__name__") and func.__name__ != "<lambda>":
             current_span.set_attribute("datasource.stage.strategy", func.__name__)
 
-        if stage_name == self.stages[0]:  # First stage (load)
+        if stage_name == "load":
             result = await func(**kwargs)
+        elif stage_name == "pipe":
+            result = await func(data, dependencies, **kwargs)
         else:
             # All other stages receive data from previous stage
             # and dependencies, and operations are done in-memory
@@ -390,6 +405,20 @@ class DataSource(ABC):
         elif request is None:
             request = DataRequest(stages={})
 
+        # Bind and validate — order, strategies, params, type chain
+        if request.source is None:
+            request.source = self
+        elif request.source is not self:
+            raise ValueError(
+                f"Request bound to {request.source.source_id}, "
+                f"called on {self.source_id}"
+            )
+        request.validate()
+
+        obs = get_observer()
+        if obs is not None:
+            await obs.before_node(request)
+
         request_id = request.request_id
 
         # Record request start
@@ -415,6 +444,8 @@ class DataSource(ABC):
         if self.cache is not None:
             cached = self.cache.get(cache_key)
             if cached is not None:
+                if obs is not None:
+                    obs.cache_hit(request, cached)
                 if request.enable_telemetry:
                     self._record_metric(
                         "total_execution_time_histogram",
@@ -469,6 +500,8 @@ class DataSource(ABC):
 
             execution_start = time.time()
             stage_name = None
+            if obs is not None:
+                obs.node_started(request)
             try:
                 self.logger.info(
                     f"Fetching data from {self.source_id} for {request.request_id}",
@@ -570,6 +603,9 @@ class DataSource(ABC):
                     },
                 )
 
+                if obs is not None:
+                    obs.node_completed(request, data)
+
                 return data
 
             except Exception as e:
@@ -601,10 +637,9 @@ class DataSource(ABC):
                     },
                     exc_info=True,
                 )
+                if obs is not None:
+                    obs.node_failed(request, e)
                 raise
-
-    # necessary to avoid cache misses
-    __repr__ = __str__
 
 
 class Multiplexer(DataSource):
@@ -687,6 +722,9 @@ class Demultiplexer(DataSource):
         self.regs["search"].register("default", linear_search)
         self.regs["search"].register("html", html_search)
 
+        # too many logs!
+        #self.logger.setLevel(logging.WARNING)
+
     async def get_load_params(self, params, dependencies):
         """Prepare parameters for the split loader.
 
@@ -748,6 +786,7 @@ class WebDataSource(DataSource):
         cache: Optional[CacheBackend] = True,
         rate_limiter=WindowRateLimiter(1 / 5),
         base_headers: Dict = None,
+        cookies: Dict = None,
     ):
         """Initialize a WebDataSource.
 
@@ -769,6 +808,7 @@ class WebDataSource(DataSource):
             cache = FileCache(cache_dir=CACHE_DIR / source_id)
         super().__init__(source_id, cache, rate_limiter)
         self.base_headers = base_headers or {}
+        self.cookies = cookies or {}
 
         self._session = None
         self._session_lock = asyncio.Lock()
@@ -795,7 +835,7 @@ class WebDataSource(DataSource):
         async with self._session_lock:
             if self._session is None:
                 self._session = aiohttp.ClientSession(
-                    headers=self.base_headers, timeout=aiohttp.ClientTimeout(total=30)
+                    headers=self.base_headers, timeout=aiohttp.ClientTimeout(total=30), cookies=self.cookies
                 )
                 self.logger.debug("Created new async HTTP session")
         return self._session
@@ -950,4 +990,15 @@ class FileDataSource(DataSource):
             Search strategy identifier ('binary' by default)
         """
         del dependencies, params
-        return "binary"
+
+        file_path = params.get("file_path")
+        ordered = params.get("ordered")
+        if file_path is not None:
+            ext = Path(file_path).suffix.lower().lstrip(".")
+        else:
+            ext = "txt"
+        if ext in {"txt", "log"}:
+            return "text"
+        if ordered or ext in {"csv", "tsv"}:
+            return "binary"
+        return "linear"

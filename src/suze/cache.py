@@ -349,8 +349,8 @@ class FileCache(CacheBackend):
             self._record_operation(
                 "file_write", key, attributes={"file_size": len(data)}
             )
-        except (pickle.PickleError, OSError) as e:
-            self.logger.error(f"Failed to cache {key}: {e}")
+        except (pickle.PickleError, OSError, TypeError) as e:
+            self.logger.error(f"Failed to cache {key}, {value}: {e}")
             self._record_operation("write_error", key, attributes={"error": str(e)})
             self._delete(key)
             raise

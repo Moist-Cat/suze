@@ -15,16 +15,14 @@ from opentelemetry.sdk.metrics.export import (
     PeriodicExportingMetricReader,
     ConsoleMetricExporter,
 )
-import opentelemetry.instrumentation.instrumentor as otel_instrumentor
-from opentelemetry.instrumentation.asyncio import AsyncioInstrumentor
 
-APP_VERBOSE_NAME = "Suze - E.T.L. Framework"
+APP_VERBOSE_NAME = "Suze - E.T.L. pipeline generator"
 APP_NAME = "suze"
 BASE_DIR = Path(__file__).parent
 CACHE_DIR = Path(os.getenv("SUZE_CACHE_DIR", BASE_DIR / "cache"))
 
 # Config
-DEBUG = False
+DEBUG = os.getenv("SUZE_DEBUG", False)
 FILE_LOGGING = os.getenv("SUZE_FILELOGGING", True)
 if isinstance(FILE_LOGGING, str) and not FILE_LOGGING.strip():
     FILE_LOGGING = False
@@ -75,6 +73,10 @@ def init_opentelemetry(service_name: str = "suze"):
 
 init_opentelemetry(service_name=APP_NAME)
 
+LOG_DIR = BASE_DIR / "logs"
+if not LOG_DIR.exists():
+    LOG_DIR.mkdir(parents=True)
+
 # Logging
 LOGGERS = {
     "version": 1,
@@ -101,7 +103,7 @@ LOGGERS = {
                 "class": "logging.handlers.RotatingFileHandler",
                 "maxBytes": 5000000,
                 "backupCount": 5,
-                "filename": BASE_DIR / "logs" / "api.error.log",
+                "filename": LOG_DIR / "api.error.log",
                 "encoding": "utf-8",
                 "formatter": "detailed",
                 "level": "ERROR",

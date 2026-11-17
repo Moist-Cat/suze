@@ -1,0 +1,22 @@
+[daemon]
+socket = "/run/suze/suze.sock"
+pidfile = "/run/suze/suze.pid"
+socket_mode = "0600"
+credits = 4
+max_retained_pipelines = 100
+report_interval = 0          # seconds; 0 = disabled
+
+[[pipelines]]
+id = "refresh-prices"
+factory = "myapp.pipelines:make_prices_request"
+trigger = "ttl"
+ttl_threshold = 60
+cost = 1
+timeout_seconds = 300
+
+[[pipelines]]
+id = "daily-report"
+factory = "myapp.pipelines:make_report_request"
+trigger = "cron"
+cron = "0 9 * * *"
+cost = 2
